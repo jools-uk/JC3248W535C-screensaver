@@ -40,28 +40,47 @@ static const char *TAG = "fractal";
 #define TOUCH_RST_IO  12
 
 /* ── Display ──────────────────────────────────────────────────────────────── */
-/* Logical landscape dimensions seen by the fractal, touch, and UI code */
-#define LCD_W          480
-#define LCD_H          320
-#define LCD_CLK_HZ     (40 * 1000 * 1000)
-#define LCD_PIX        (LCD_W * LCD_H)
-
-/* Physical portrait dimensions used for window addressing.
- * Software rotation maps LCD_W×LCD_H landscape → DISP_W×DISP_H portrait. */
+/* Physical panel dimensions — native portrait CASET/RASET addressing. */
 #define DISP_W         320
 #define DISP_H         480
+#define LCD_CLK_HZ     (40 * 1000 * 1000)
 
-/* Strip-based DMA — sized for physical portrait strips */
+/* Software rotation applied in the flush functions.
+ * 0 = portrait (no rotation)
+ * 90 = landscape CW   (portrait right becomes top)
+ * 180 = portrait upside-down
+ * 270 = landscape CCW (portrait left becomes top)  */
+#define DISP_ROTATE    270
+
+/* Logical dimensions seen by the fractal, touch, and UI.
+ * Swapped from physical for 90° / 270° rotations. */
+#if (DISP_ROTATE == 90) || (DISP_ROTATE == 270)
+#  define LCD_W        DISP_H   /* 480 */
+#  define LCD_H        DISP_W   /* 320 */
+#else
+#  define LCD_W        DISP_W   /* 320 */
+#  define LCD_H        DISP_H   /* 480 */
+#endif
+
+#define LCD_PIX        (LCD_W * LCD_H)
+
+/* Strip-based DMA — always sized for physical portrait strips. */
 #define STRIP_H        80
 #define STRIP_PIXELS   (DISP_W * STRIP_H)
 
 /* ── Touch ────────────────────────────────────────────────────────────────── */
 #define TOUCH_I2C_ADDR    0x3B
-#define TOUCH_SWAP_XY     1
-#define TOUCH_MIRROR_X    0
-#define TOUCH_MIRROR_Y    1
-#define TOUCH_X_RAW_MAX   320   /* IC x-axis native range */
-#define TOUCH_Y_RAW_MAX   480   /* IC y-axis native range */
+/* IC always reports: raw_x = portrait column (0–320), raw_y = portrait row (0–480).
+ * Coordinate mapping is derived from DISP_ROTATE in touch_read(). */
+#define TOUCH_X_RAW_MAX   320
+#define TOUCH_Y_RAW_MAX   480
+
+/* ── Fractal home view ────────────────────────────────────────────────────── */
+/* The "home" view shows the whole Mandelbrot set.  Tap re-anchors the centre
+ * to the tapped point (mapped through this fixed frame) and resets the zoom. */
+#define HOME_CX   -0.5f
+#define HOME_CY    0.0f
+#define HOME_HW   10.0f   /* x spans [-2, 1], y spans [-1, 1] at 480×320 */
 
 /* ── Fractal / animation ──────────────────────────────────────────────────── */
 #define MAX_ITER        200
@@ -89,9 +108,9 @@ static i2c_master_dev_handle_t   touch_dev;
 static SemaphoreHandle_t dma_done_sem;
 
 /* Shared view state – written by touch task, read by render task. */
-static volatile float view_cx  = -0.5f;
-static volatile float view_cy  =  0.0f;
-static volatile float view_hw  = 10.0f;
+static volatile float view_cx  = HOME_CX;
+static volatile float view_cy  = HOME_CY;
+static volatile float view_hw  = HOME_HW;
 static volatile bool  rerender =  false;
 
 /* Fractal coords of the deepest boundary pixel in the last render.
@@ -222,7 +241,7 @@ static void lcd_cmd(uint8_t cmd, const uint8_t *data, size_t len)
     esp_lcd_panel_io_tx_param(io_handle, c, data, len);
 }
 
-/* RASET before CASET — ESPHome send order; inclusive x1/y1 endpoints */
+/* Portrait window: RASET=y (portrait rows 0–479), CASET=x (portrait cols 0–319). */
 static void lcd_set_window(int x0, int y0, int x1, int y1)
 {
     uint8_t rs[4] = { y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF };
@@ -304,16 +323,39 @@ static void text_draw(uint16_t *fb, int x, int y, const char *str,
     }
 }
 
-/* DMA-strip a landscape RGB565 framebuffer to the portrait display (90° CW rotation). */
+/* DMA-strip a logical RGB565 framebuffer to the physical portrait display,
+ * applying the software rotation selected by DISP_ROTATE. */
 static void flush_color_fb(const uint16_t *fb)
 {
     for (int y0 = 0; y0 < DISP_H; y0 += STRIP_H) {
         xSemaphoreTake(dma_done_sem, portMAX_DELAY);
+#if DISP_ROTATE == 0
+        /* No rotation: portrait logical == portrait physical. */
+        for (int r = 0; r < STRIP_H; r++)
+            for (int c = 0; c < DISP_W; c++)
+                strip_buf[r * DISP_W + c] = fb[(y0 + r) * LCD_W + c];
+#elif DISP_ROTATE == 90
+        /* 90° CW: portrait(c, y0+r) ← logical(lx=DISP_H-1-y0-r, ly=c). */
         for (int c = 0; c < DISP_W; c++) {
             const uint16_t *src = &fb[c * LCD_W + (DISP_H - 1 - y0)];
             for (int r = 0; r < STRIP_H; r++)
                 strip_buf[r * DISP_W + c] = src[-r];
         }
+#elif DISP_ROTATE == 180
+        /* 180°: portrait(c, y0+r) ← logical(DISP_W-1-c, DISP_H-1-y0-r). */
+        for (int r = 0; r < STRIP_H; r++) {
+            const uint16_t *src = &fb[(DISP_H - 1 - y0 - r) * LCD_W + (DISP_W - 1)];
+            for (int c = 0; c < DISP_W; c++)
+                strip_buf[r * DISP_W + c] = src[-c];
+        }
+#elif DISP_ROTATE == 270
+        /* 270° CCW: portrait(c, y0+r) ← logical(lx=y0+r, ly=DISP_W-1-c). */
+        for (int c = 0; c < DISP_W; c++) {
+            const uint16_t *src = &fb[(DISP_W - 1 - c) * LCD_W + y0];
+            for (int r = 0; r < STRIP_H; r++)
+                strip_buf[r * DISP_W + c] = src[r];
+        }
+#endif
         lcd_set_window(0, y0, DISP_W - 1, y0 + STRIP_H - 1);
         lcd_ramwr(strip_buf, STRIP_PIXELS);
     }
@@ -340,10 +382,10 @@ static void display_orientation_guide(void)
             bool in_tri = row >= 14 && row < 60
                           && col >= LCD_W/2 - tri_hw
                           && col <= LCD_W/2 + tri_hw;
-            bool in_tl  = row <  80         && col < 80;
-            bool in_tr  = row <  80         && col >= LCD_W - 80;
-            bool in_bl  = row >= LCD_H - 80 && col < 80;
-            bool in_br  = row >= LCD_H - 80 && col >= LCD_W - 80;
+            bool in_tl  = row <  LCD_H/4     && col < LCD_W/6;
+            bool in_tr  = row <  LCD_H/4     && col >= LCD_W - LCD_W/6;
+            bool in_bl  = row >= LCD_H*3/4   && col < LCD_W/6;
+            bool in_br  = row >= LCD_H*3/4   && col >= LCD_W - LCD_W/6;
             uint16_t px = 0x0000;
             if      (in_top || in_tri) px = wh;
             else if (in_tl)            px = tl;
@@ -356,17 +398,16 @@ static void display_orientation_guide(void)
 
     /* Overlay text labels — transparent bg so corner colour shows through */
     const uint8_t *font = u8g2_font_ncenB14_tr;
-    text_draw(fb,              8,  8, "TL", font, wh,   0x0001);
-    text_draw(fb, LCD_W - 46,  8, "TR", font, wh,   0x0001);
-    text_draw(fb,              8, LCD_H - 30, "BL", font, wh, 0x0001);
-    text_draw(fb, LCD_W - 46, LCD_H - 30, "BR", font, wh, 0x0001);
+    text_draw(fb,              8,               8, "TL", font, wh, 0x0001);
+    text_draw(fb, LCD_W - 46,                 8, "TR", font, wh, 0x0001);
+    text_draw(fb,              8,  LCD_H - 30,    "BL", font, wh, 0x0001);
+    text_draw(fb, LCD_W - 46,  LCD_H - 30,        "BR", font, wh, 0x0001);
 
     flush_color_fb(fb);
-    vTaskDelay(pdMS_TO_TICKS(6000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
 }
 
-/* Fill the entire physical display with one solid colour — diagnostic helper.
- * Works in portrait address space; no rotation needed for a flat fill. */
+/* Fill the entire display with one solid colour — diagnostic helper. */
 static void display_fill(uint16_t colour)
 {
     for (int i = 0; i < STRIP_PIXELS; i++) strip_buf[i] = colour;
@@ -381,26 +422,40 @@ static void display_fill(uint16_t colour)
    flush_frame — apply palette (with rotation) and DMA each strip.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* flush_frame — rotate 90° CW: landscape index_buf → portrait strip_buf → display.
- *
- * Portrait pixel (col=c, row=y0+r)  ←  landscape pixel (lx = DISP_H-1-y0-r, ly = c)
- * src pointer walks backwards through a landscape row — still cache-friendly. */
+/* flush_frame — apply palette and DMA each strip with DISP_ROTATE software rotation. */
 static void flush_frame(int pal_offset)
 {
+#define MAP(idx) ((idx) == IN_SET_SENTINEL ? 0x0000 \
+                  : palette[((idx) + pal_offset) & PALETTE_MASK])
     for (int y0 = 0; y0 < DISP_H; y0 += STRIP_H) {
         xSemaphoreTake(dma_done_sem, portMAX_DELAY);
+#if DISP_ROTATE == 0
+        for (int r = 0; r < STRIP_H; r++)
+            for (int c = 0; c < DISP_W; c++)
+                strip_buf[r * DISP_W + c] = MAP(index_buf[(y0 + r) * LCD_W + c]);
+#elif DISP_ROTATE == 90
         for (int c = 0; c < DISP_W; c++) {
             const uint16_t *src = &index_buf[c * LCD_W + (DISP_H - 1 - y0)];
-            for (int r = 0; r < STRIP_H; r++) {
-                uint16_t idx = src[-r];
-                strip_buf[r * DISP_W + c] = (idx == IN_SET_SENTINEL)
-                    ? 0x0000
-                    : palette[(idx + pal_offset) & PALETTE_MASK];
-            }
+            for (int r = 0; r < STRIP_H; r++)
+                strip_buf[r * DISP_W + c] = MAP(src[-r]);
         }
+#elif DISP_ROTATE == 180
+        for (int r = 0; r < STRIP_H; r++) {
+            const uint16_t *src = &index_buf[(DISP_H - 1 - y0 - r) * LCD_W + (DISP_W - 1)];
+            for (int c = 0; c < DISP_W; c++)
+                strip_buf[r * DISP_W + c] = MAP(src[-c]);
+        }
+#elif DISP_ROTATE == 270
+        for (int c = 0; c < DISP_W; c++) {
+            const uint16_t *src = &index_buf[(DISP_W - 1 - c) * LCD_W + y0];
+            for (int r = 0; r < STRIP_H; r++)
+                strip_buf[r * DISP_W + c] = MAP(src[r]);
+        }
+#endif
         lcd_set_window(0, y0, DISP_W - 1, y0 + STRIP_H - 1);
         lcd_ramwr(strip_buf, STRIP_PIXELS);
     }
+#undef MAP
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -469,13 +524,26 @@ static bool touch_read(int *out_x, int *out_y)
     /* IC x-axis (0–LCD_W) runs along the display's y-axis, and vice-versa.
      * ESPHome normalises both axes to a common range before swapping, which
      * implicitly scales.  Replicate that: swap + scale in one step. */
-    if (TOUCH_SWAP_XY) {
-        int nx = y * LCD_W / TOUCH_Y_RAW_MAX;  /* raw y [0,480] → screen x [0,480] */
-        int ny = x * LCD_H / TOUCH_X_RAW_MAX;  /* raw x [0,320] → screen y [0,320] */
-        x = nx; y = ny;
-    }
-    if (TOUCH_MIRROR_X) { x = LCD_W - 1 - x; }
-    if (TOUCH_MIRROR_Y) { y = LCD_H - 1 - y; }
+    /* Map IC portrait coordinates to logical screen coordinates.
+     * raw_x = portrait column (0–320), raw_y = portrait row (0–480). */
+#if DISP_ROTATE == 0
+    x = (LCD_W - 1) - x * LCD_W / TOUCH_X_RAW_MAX;
+    y = (LCD_H - 1) - y * LCD_H / TOUCH_Y_RAW_MAX;
+#elif DISP_ROTATE == 90
+    /* CW: portrait row → lx, portrait col → ly (mirrored) */
+    { int nx = y * LCD_W / TOUCH_Y_RAW_MAX;
+      y = (LCD_H - 1) - x * LCD_H / TOUCH_X_RAW_MAX;
+      x = nx; }
+#elif DISP_ROTATE == 180
+    /* IC reversals cancel the 180° flip — direct mapping */
+    x = x * LCD_W / TOUCH_X_RAW_MAX;
+    y = y * LCD_H / TOUCH_Y_RAW_MAX;
+#elif DISP_ROTATE == 270
+    /* CCW: portrait row → lx (mirrored), portrait col → ly */
+    { int nx = (LCD_W - 1) - y * LCD_W / TOUCH_Y_RAW_MAX;
+      y = x * LCD_H / TOUCH_X_RAW_MAX;
+      x = nx; }
+#endif
     *out_x = x;
     *out_y = y;
     return true;
@@ -488,21 +556,29 @@ static bool touch_read(int *out_x, int *out_y)
 static void touch_task(void *pv)
 {
     ESP_LOGI(TAG, "touch task running");
-    bool was_down = false;
+    bool was_down  = false;
+    int  up_streak = 0;   /* consecutive no-touch polls before lifting */
     while (1) {
         int tx, ty;
         bool touched = touch_read(&tx, &ty);
-        if (touched && !was_down) {
-            was_down = true;
-            float fx, fy;
-            screen_to_fractal(tx, ty, view_cx, view_cy, view_hw, &fx, &fy);
-            ESP_LOGI(TAG, "touch screen=(%d,%d) → fractal=(%.6f, %.6f), re-centring",
-                     tx, ty, (double)fx, (double)fy);
-            view_cx  = fx;
-            view_cy  = fy;
-            rerender = true;
-        } else if (!touched) {
-            was_down = false;
+        if (touched) {
+            up_streak = 0;
+            if (!was_down) {
+                was_down = true;
+                float fx, fy;
+                /* Map tap through the fixed home frame so any screen position
+                 * always selects the same fractal point regardless of zoom depth. */
+                screen_to_fractal(tx, ty, HOME_CX, HOME_CY, HOME_HW, &fx, &fy);
+                ESP_LOGI(TAG, "touch screen=(%d,%d) → fractal=(%.6f,%.6f), restart zoom",
+                         tx, ty, (double)fx, (double)fy);
+                view_cx  = fx;
+                view_cy  = fy;
+                view_hw  = HOME_HW;
+                rerender = true;
+            }
+        } else {
+            if (++up_streak >= 3)   /* 3 × 20 ms = 60 ms no-touch to confirm lift */
+                was_down = false;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -557,9 +633,9 @@ static void render_task(void *pv)
             view_hw *= ZOOM_STEP;
 
             if (view_hw < ZOOM_MIN) {
-                view_cx = -0.5f;
-                view_cy =  0.0f;
-                view_hw = 10.0f;
+                view_cx = HOME_CX;
+                view_cy = HOME_CY;
+                view_hw = HOME_HW;
                 ESP_LOGI(TAG, "zoom reset (precision floor)");
             }
 
@@ -623,7 +699,7 @@ static void display_init(void)
     static const uint8_t vendor_unlock[8] = { 0x00,0x00,0x00,0x00,0x00,0x00,0x5A,0xA5 };
     static const uint8_t vendor_lock[8]   = { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
     static const uint8_t c1_data[1]       = { 0x33 };
-    static const uint8_t madctl[1]        = { 0x00 };  /* portrait, software rotation handles landscape */
+    static const uint8_t madctl[1]        = { 0x00 };  /* portrait native; software rotation handles landscape */
     static const uint8_t colmod[1]        = { 0x55 };  /* 16-bit RGB565 */
     static const uint8_t brightness[1]    = { 0xD0 };
 
